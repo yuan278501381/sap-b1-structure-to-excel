@@ -32,7 +32,7 @@ SELECT
       T0.Descr AS [描述],
 
       CASE 
-        WHEN T0.TypeID = 'A' AND T0.EditType = '' THEN N'字母数字-定期'
+        WHEN T0.TypeID = 'A' AND isnull(T0.EditType,'') = '' THEN N'字母数字-定期'
         WHEN T0.TypeID = 'A' AND T0.EditType = 'T' THEN N'文本'
         WHEN T0.TypeID = 'A' AND T0.EditType = 'I' THEN N'图片'
         WHEN T0.TypeID = 'A' AND T0.EditType = 'C' THEN N'复选框'
@@ -47,7 +47,7 @@ SELECT
         WHEN T0.TypeID = 'M' THEN N'备注'
         ELSE N'其他/未知 (' + CAST(T0.TypeID AS NVARCHAR(10)) + N'_' + CAST(T0.EditType AS NVARCHAR(10)) + N')' 
       END AS [类型],
-
+      t0.TypeID,t0.EditType,
       CASE WHEN T0.TypeID = 'B' THEN NULL ELSE T0.EditSize END AS 长度,
 
       (SELECT STRING_AGG(CAST(T1.FldValue AS NVARCHAR(MAX)) + N':' + CAST(T1.Descr AS NVARCHAR(MAX)) + N';', CHAR(13) + CHAR(10)) 
@@ -87,7 +87,10 @@ LEFT JOIN OUTB t3 on CONCAT('@', t3.TableName)= t0.TableID
 WHERE 
       1 = 1 
       and t0.TableID in (
-   '@CH_ORGITYPE','@ITEMTYPE','@KCC_ATTR1','@KCC_PROD_LINE','@MAIN_COLOR_CARD','@MAIN_COLOR_CODE','@PRODUCT_ATTR','@PRODUCT_ATTR_1','@RULE_EXPR','@RULE_EXPR_1','@RULE_GEN','@RULE_GEN_1','@RULE_ITEM_MASTER','@RULE_ITEM_MASTER_1','@RULE_ITMCODE_CRT','@RULE_ITMCODE_CRT_1','@RULE_ITMCODE_CRT_2','@RULE_TXT_EXPR','@RULE_TXT_EXPR_1','@TMP_CLASS','@TMP_LOWERSTOP','@TMP_STRAPE','@TMP_TEETH','@TMP_UPPERSTOP','@TYPE','@WHS_HEAD','@ZIPPER_HEAD_COLOR','@ZIPPER_HEAD_COLORCD','@ZIPPER_HEAD_CONNCT','@ZIPPER_HEAD_LABEL','@ZIPPER_PULL_TAB','@ZIPPER_PULL_TAB_1'
+   '@CH_ORGITYPE','@ITEMTYPE','@KCC_ATTR1','@MAIN_COLOR_CARD','@MAIN_COLOR_CODE','@PRODUCT_ATTR','@PRODUCT_ATTR_1',
+   '@RULE_EXPR','@RULE_EXPR_1','@RULE_GEN','@RULE_GEN_1','@RULE_ITEM_MASTER','@RULE_ITEM_MASTER_1','@RULE_ITMCODE_CRT','@RULE_ITMCODE_CRT_1',
+   '@RULE_ITMCODE_CRT_2','@RULE_TXT_EXPR','@RULE_TXT_EXPR_1','@TMP_CLASS','@TMP_LOWERSTOP','@TMP_STRAPE','@TMP_TEETH','@TMP_UPPERSTOP','@TYPE','@WHS_HEAD',
+   '@ZIPPER_HEAD_COLOR','@ZIPPER_HEAD_COLORCD','@ZIPPER_HEAD_CONNCT','@ZIPPER_HEAD_LABEL','@ZIPPER_PULL_TAB','@ZIPPER_PULL_TAB_1'
       )
 
 ORDER BY t2.Code desc , T0.TableID, T0.FieldID;
@@ -117,16 +120,35 @@ def clean_text(text):
 def clean_sheet_name(name, used_names_lower):
     if pd.isna(name) or name == "": name = "Unknown"
     name = str(name)
-    # 替换掉 Excel Sheet 名称不支持的特殊字符
-    for char in ['\\', '/', '*', '[', ']', ':', '?']:
-        name = name.replace(char, '_')
+
+    # 1. 替换掉 Excel Sheet 名称不支持的特殊字符，全部替换为空格
+    # Excel 英文禁止: \ / * [ ] : ?
+    # 增加中文全角符号替换: ： ？ ／ ＼ ［ ］ 【 】 *
+    invalid_chars = [
+        '\\', '/', '*', '[', ']', ':', '?',
+        '：', '？', '／', '＼', '［', '］', '【', '】'
+    ]
+
+    for char in invalid_chars:
+        name = name.replace(char, ' ')
+
+    # 2. 去除首尾空格
+    name = name.strip()
+
+    # 3. 如果 strip 后为空，给予默认名
+    if not name:
+        name = "Unknown"
+
+    # 截取前25个字符 (留出空间给后缀)
     base_name = name[:25]
     candidate = base_name
     counter = 1
+
     # 确保唯一性 (忽略大小写)
     while candidate.lower() in used_names_lower:
         candidate = f"{base_name}_{counter}"
         counter += 1
+
     used_names_lower.add(candidate.lower())
     return candidate
 
@@ -228,6 +250,7 @@ def export_to_excel():
             section_title_fmt = workbook.add_format(
                 {**base_style, 'bold': True, 'bg_color': '#BFBFBF', 'border': 2, 'align': 'center'})
 
+            # 1. 顶端对齐格式 (Top Aligned) - 用于可选值、备注
             cell_fmt = workbook.add_format({**base_style, 'border': 1, 'valign': 'top', 'text_wrap': True})
             cell_left_thick_fmt = workbook.add_format(
                 {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 1, 'valign': 'top', 'text_wrap': True})
@@ -239,6 +262,19 @@ def export_to_excel():
                 {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
             cell_bottom_right_thick_fmt = workbook.add_format(
                 {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
+
+            # 2. 垂直居中格式 (Vertical Center) - 用于其他列
+            cell_fmt_vc = workbook.add_format({**base_style, 'border': 1, 'valign': 'vcenter', 'text_wrap': True})
+            cell_left_thick_fmt_vc = workbook.add_format(
+                {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 1, 'valign': 'vcenter', 'text_wrap': True})
+            cell_right_thick_fmt_vc = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 1, 'valign': 'vcenter', 'text_wrap': True})
+            cell_bottom_fmt_vc = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 1, 'top': 1, 'bottom': 2, 'valign': 'vcenter', 'text_wrap': True})
+            cell_bottom_left_thick_fmt_vc = workbook.add_format(
+                {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 2, 'valign': 'vcenter', 'text_wrap': True})
+            cell_bottom_right_thick_fmt_vc = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 2, 'valign': 'vcenter', 'text_wrap': True})
 
             used_sheet_names_lower = set()
 
@@ -333,24 +369,29 @@ def export_to_excel():
                         for c_idx, val in enumerate(row):
                             val = "" if pd.isna(val) else clean_text(str(val))
                             col_pos = c_idx
-                            fmt_to_use = cell_fmt
+
+                            # 决定是否垂直居中
+                            # 0:字段名, 1:描述, 2:类型, 3:长度, 4:设置链接表, 5:可选值, 6:字段默认值, 7:必填字段, 8:备注
+                            # 目标: 垂直居中 -> 0, 1, 2, 3, 4, 6, 7
+                            use_vc = col_pos in [0, 1, 2, 3, 4, 6, 7]
+
                             is_left_edge = (col_pos == 0)
                             is_right_edge = (col_pos == len(display_columns) - 1)
 
                             if is_last_row:
                                 if is_left_edge:
-                                    fmt_to_use = cell_bottom_left_thick_fmt
+                                    fmt_to_use = cell_bottom_left_thick_fmt_vc if use_vc else cell_bottom_left_thick_fmt
                                 elif is_right_edge:
-                                    fmt_to_use = cell_bottom_right_thick_fmt
+                                    fmt_to_use = cell_bottom_right_thick_fmt_vc if use_vc else cell_bottom_right_thick_fmt
                                 else:
-                                    fmt_to_use = cell_bottom_fmt
+                                    fmt_to_use = cell_bottom_fmt_vc if use_vc else cell_bottom_fmt
                             else:
                                 if is_left_edge:
-                                    fmt_to_use = cell_left_thick_fmt
+                                    fmt_to_use = cell_left_thick_fmt_vc if use_vc else cell_left_thick_fmt
                                 elif is_right_edge:
-                                    fmt_to_use = cell_right_thick_fmt
+                                    fmt_to_use = cell_right_thick_fmt_vc if use_vc else cell_right_thick_fmt
                                 else:
-                                    fmt_to_use = cell_fmt
+                                    fmt_to_use = cell_fmt_vc if use_vc else cell_fmt
 
                             if c_idx == 3 and val.isdigit():
                                 worksheet.write_number(actual_row, c_idx + 1, int(val), fmt_to_use)
@@ -435,23 +476,27 @@ def export_to_excel():
                     for c_idx, val in enumerate(row):
                         val = "" if pd.isna(val) else clean_text(str(val))
                         col_pos = c_idx
-                        fmt_to_use = cell_fmt
+
+                        # 决定是否垂直居中
+                        # 0:字段名, 1:描述, 2:类型, 3:长度, 4:设置链接表, 5:可选值, 6:字段默认值, 7:必填字段, 8:备注
+                        use_vc = col_pos in [0, 1, 2, 3, 4, 6, 7]
+
                         is_left_edge = (col_pos == 0)
                         is_right_edge = (col_pos == len(display_columns) - 1)
                         if is_last_row:
                             if is_left_edge:
-                                fmt_to_use = cell_bottom_left_thick_fmt
+                                fmt_to_use = cell_bottom_left_thick_fmt_vc if use_vc else cell_bottom_left_thick_fmt
                             elif is_right_edge:
-                                fmt_to_use = cell_bottom_right_thick_fmt
+                                fmt_to_use = cell_bottom_right_thick_fmt_vc if use_vc else cell_bottom_right_thick_fmt
                             else:
-                                fmt_to_use = cell_bottom_fmt
+                                fmt_to_use = cell_bottom_fmt_vc if use_vc else cell_bottom_fmt
                         else:
                             if is_left_edge:
-                                fmt_to_use = cell_left_thick_fmt
+                                fmt_to_use = cell_left_thick_fmt_vc if use_vc else cell_left_thick_fmt
                             elif is_right_edge:
-                                fmt_to_use = cell_right_thick_fmt
+                                fmt_to_use = cell_right_thick_fmt_vc if use_vc else cell_right_thick_fmt
                             else:
-                                fmt_to_use = cell_fmt
+                                fmt_to_use = cell_fmt_vc if use_vc else cell_fmt
 
                         if c_idx == 3 and val.isdigit():
                             worksheet.write_number(actual_row, c_idx + 1, int(val), fmt_to_use)
