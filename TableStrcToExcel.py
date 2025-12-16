@@ -3,6 +3,7 @@ from sqlalchemy import create_engine
 import urllib.parse
 import pyodbc
 import socket
+import re
 
 # ================= 配置区域 =================
 DB_SERVER = '192.168.134.9'
@@ -12,12 +13,18 @@ DB_PASSWORD = '123456@a'
 
 OUTPUT_FILE = 'SAP_UDO_字段结构.xlsx'
 
-# SQL 查询保持不变
+# 调试模式
+DEBUG_MODE = False
+
+# SQL 查询:
+# 1. 增加了 t2.IsHeader 字段来区分主表和行表
+# 2. 修改了 t2.Type 逻辑，拼接了 UDO 属性 (可移除/可关闭/可取消)
 SQL_QUERY = """
 SELECT 
       t2.Code  UDO代码,
       t2.Name  UDO名,
       t2.Type UDO类型,
+      t2.IsHeader, -- 1=主表, 0=子表
       T0.TableID 表, 
       t3.Descr 表名称,
 
@@ -47,14 +54,31 @@ SELECT
        FROM UFD1 T1 
        WHERE T1.TableID = T0.TableID AND T1.FieldID = T0.FieldID) AS 可选值,        
       T0.Dflt 默认值, 
-      T0.RTable 链接表
+      T0.RTable 链接表,
+      ISNULL(T0.NotNull, 'N') AS 必填字段
 
 FROM CUFD T0
 LEFT JOIN (
-    SELECT Code, Name, concat('@', TableName )TableName, Case when TYPE =1 then N'主数据' when TYPE=3 then N'单据'END Type
+    -- 1. 获取 UDO 主表关联 (IsHeader = 1)
+    SELECT Code, Name, concat('@', TableName )TableName, 
+           (CASE WHEN TYPE = 1 THEN N'主数据' WHEN TYPE = 3 THEN N'单据' ELSE N'其他' END) + 
+           N' (' + 
+           (CASE WHEN CanDelete = 'Y' THEN N'可移除' ELSE N'不可移除' END) + N', ' +
+           (CASE WHEN CanClose = 'Y' THEN N'可关闭' ELSE N'不可关闭' END) + N', ' +
+           (CASE WHEN CanCancel = 'Y' THEN N'可取消' ELSE N'不可取消' END) + 
+           N')' as Type,
+           1 as IsHeader
     FROM OUDO
     UNION 
-    SELECT t.Code, t.Name, concat('@', t1.TableName )TableName, Case when TYPE =1 then N'主数据' when TYPE=3 then N'单据'END Type
+    -- 2. 获取 UDO 子表关联 (IsHeader = 0)
+    SELECT t.Code, t.Name, concat('@', t1.TableName )TableName, 
+           (CASE WHEN t.TYPE = 1 THEN N'主数据' WHEN t.TYPE = 3 THEN N'单据' ELSE N'其他' END) + 
+           N' (' + 
+           (CASE WHEN t.CanDelete = 'Y' THEN N'可移除' ELSE N'不可移除' END) + N', ' +
+           (CASE WHEN t.CanClose = 'Y' THEN N'可关闭' ELSE N'不可关闭' END) + N', ' +
+           (CASE WHEN t.CanCancel = 'Y' THEN N'可取消' ELSE N'不可取消' END) + 
+           N')' as Type,
+           0 as IsHeader
     FROM OUDO t
     INNER JOIN UDO1 t1 ON t.Code = t1.Code
 ) t2 ON T0.TableID = t2.TableName
@@ -70,56 +94,58 @@ ORDER BY t2.Code desc , T0.TableID, T0.FieldID;
 """
 
 
-def clean_sheet_name(name, used_names):
-    """Excel Sheet 名称清洗并确保唯一"""
-    if pd.isna(name) or name == "":
-        name = "Unknown"
-    name = str(name)
-    invalid_chars = ['\\', '/', '*', '[', ']', ':', '?']
-    for char in invalid_chars:
-        name = name.replace(char, '_')
+def clean_text(text):
+    """
+    深度清洗字符串，防止 Excel 损坏。
+    """
+    if not isinstance(text, str): return text
 
-    # 截取前30个字符
-    base_name = name[:25]  # 留一点空间给后缀
+    # 1. 移除 Excel 不支持的控制字符 (ASCII 0-31, 排除 \n \r \t)
+    text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
+
+    # 2. Excel 单元格最大支持 32767 字符。如果超长，直接截断。
+    if len(text) > 32700:
+        text = text[:32700] + "..."
+
+    # 3. 防止将文本误判为公式。如果以 '=' 开头，前面加单引号强制转文本。
+    if text.startswith('='):
+        text = "'" + text
+
+    return text
+
+
+def clean_sheet_name(name, used_names_lower):
+    if pd.isna(name) or name == "": name = "Unknown"
+    name = str(name)
+    # 替换掉 Excel Sheet 名称不支持的特殊字符
+    for char in ['\\', '/', '*', '[', ']', ':', '?']:
+        name = name.replace(char, '_')
+    base_name = name[:25]
     candidate = base_name
     counter = 1
-
-    while candidate in used_names:
+    # 确保唯一性 (忽略大小写)
+    while candidate.lower() in used_names_lower:
         candidate = f"{base_name}_{counter}"
         counter += 1
-
-    used_names.add(candidate)
+    used_names_lower.add(candidate.lower())
     return candidate
 
 
 def get_best_driver():
-    """检测并返回最佳的 SQL Server ODBC 驱动"""
     try:
         installed_drivers = pyodbc.drivers()
-        print(f"系统中已安装的 ODBC 驱动: {installed_drivers}")
     except Exception:
         return None
-
-    preferences = [
-        'ODBC Driver 18 for SQL Server',
-        'ODBC Driver 17 for SQL Server',
-        'SQL Server Native Client 11.0',
-        'ODBC Driver 13 for SQL Server',
-        'SQL Server'
-    ]
-
+    preferences = ['ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server', 'SQL Server Native Client 11.0',
+                   'ODBC Driver 13 for SQL Server', 'SQL Server']
     for pref in preferences:
-        if pref in installed_drivers:
-            return pref
-
+        if pref in installed_drivers: return pref
     for driver in installed_drivers:
-        if 'SQL Server' in driver:
-            return driver
+        if 'SQL Server' in driver: return driver
     return None
 
 
 def test_tcp_connection(host, port=1433):
-    """测试 TCP 端口连通性"""
     print(f"\n--- 开始网络诊断 ---")
     print(f"正在尝试连接主机 {host} 的端口 {port} ...")
     try:
@@ -127,7 +153,6 @@ def test_tcp_connection(host, port=1433):
         sock.settimeout(3)
         result = sock.connect_ex((host, port))
         sock.close()
-
         if result == 0:
             print(f"✅ 成功: 网络通畅，端口 {port} 开放。")
             return True
@@ -142,7 +167,6 @@ def test_tcp_connection(host, port=1433):
 
 
 def export_to_excel():
-    # 0. 网络自检
     if not test_tcp_connection(DB_SERVER, 1433):
         print("警告: 网络连接测试失败，建议检查防火墙。")
 
@@ -153,7 +177,6 @@ def export_to_excel():
         return
     print(f"正在使用驱动程序: {driver_name}")
 
-    # 1. 构建连接字符串 (强制 TCP, 信任证书)
     server_addr = DB_SERVER
     if not server_addr.startswith('tcp:'):
         server_addr = f'tcp:{server_addr}'
@@ -174,96 +197,277 @@ def export_to_excel():
         df = pd.read_sql(SQL_QUERY, engine)
         print(f"查询完成，共获取 {len(df)} 行数据。正在生成 Excel...")
 
-        # 定义要显示在表格里的核心列（去掉重复的表名、UDO名等）
-        display_columns = ['字段名', '描述', '类型', '长度', '可选值', '默认值', '链接表']
+        df = df.rename(columns={'链接表': '设置链接表', '默认值': '字段默认值'})
+        if '备注' not in df.columns: df['备注'] = ""
 
-        with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter') as writer:
+        # 将“长度”列转换为 Int64 类型，去除 .0 小数位
+        df['长度'] = pd.to_numeric(df['长度'], errors='coerce').astype('Int64')
+
+        display_columns = ['字段名', '描述', '类型', '长度', '设置链接表', '可选值', '字段默认值', '必填字段', '备注']
+
+        # --- 系统字段 (备注已置空) ---
+        standard_fields_df = pd.DataFrame([
+            {'字段名': 'Code', '描述': '代码', '类型': '字母数字-定期', '长度': 50, '设置链接表': '', '可选值': '',
+             '字段默认值': '', '必填字段': 'Y', '备注': ''},
+            {'字段名': 'Name', '描述': '名称', '类型': '字母数字-文本', '长度': 100, '设置链接表': '', '可选值': '',
+             '字段默认值': '', '必填字段': 'Y', '备注': ''}
+        ])
+
+        with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter',
+                            engine_kwargs={'options': {'strings_to_urls': False, 'nan_inf_to_errors': True}}) as writer:
             workbook = writer.book
 
-            # 定义格式
-            header_fmt = workbook.add_format({
-                'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#D7E4BC', 'border': 1})
-            title_fmt = workbook.add_format({
-                'bold': True, 'font_size': 12, 'font_color': '#366092', 'bg_color': '#F2F2F2', 'border': 1})
+            # --- 样式定义 ---
+            base_style = {'font_size': 10, 'valign': 'vcenter', 'font_name': 'Microsoft YaHei'}
 
-            used_sheet_names = set()
+            header_fmt = workbook.add_format(
+                {**base_style, 'bold': True, 'text_wrap': True, 'align': 'center', 'fg_color': '#BFBFBF', 'border': 2})
+            label_fmt = workbook.add_format(
+                {**base_style, 'bold': True, 'bg_color': '#F2F2F2', 'border': 2, 'align': 'center'})
+            value_fmt = workbook.add_format({**base_style, 'border': 2, 'align': 'left'})
+            section_title_fmt = workbook.add_format(
+                {**base_style, 'bold': True, 'bg_color': '#BFBFBF', 'border': 2, 'align': 'center'})
+
+            cell_fmt = workbook.add_format({**base_style, 'border': 1, 'valign': 'top', 'text_wrap': True})
+            cell_left_thick_fmt = workbook.add_format(
+                {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 1, 'valign': 'top', 'text_wrap': True})
+            cell_right_thick_fmt = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 1, 'valign': 'top', 'text_wrap': True})
+            cell_bottom_fmt = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 1, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
+            cell_bottom_left_thick_fmt = workbook.add_format(
+                {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
+            cell_bottom_right_thick_fmt = workbook.add_format(
+                {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
+
+            used_sheet_names_lower = set()
+
+            valid_types = ['字母数字-定期', '字母数字-文本', '数字', '日期', '时间', '单位与总计-金额',
+                           '单位与总计-价格', '单位与总计-数量', '单位与总计-百分比', '单位与总计-度量', '图片',
+                           '复选框', '备注']
+            type_list_formula = f"='_配置_可选值'!$A$1:$A${len(valid_types)}"
+            yn_list_formula = "='_配置_可选值'!$B$1:$B$2"
+
+            has_created_visible_sheet = False
 
             # --- 1. 处理 UDO (按 UDO代码 分组) ---
             df_udo = df[df['UDO代码'].notna()]
+            udo_groups = list(df_udo.groupby('UDO代码'))
 
-            # 按 UDO代码 分组迭代
-            for udo_code, udo_group in df_udo.groupby('UDO代码'):
-                # 取第一行的 UDO名 作为 Sheet 名
+            if DEBUG_MODE:
+                print("【调试模式开启】仅导出前 2 个 UDO...")
+                udo_groups = udo_groups[:2]
+
+            for udo_code, udo_group in udo_groups:
+                udo_code = clean_text(str(udo_code))
                 raw_sheet_name = udo_group.iloc[0]['UDO名']
-                if pd.isna(raw_sheet_name):
-                    raw_sheet_name = udo_code
-
-                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names)
+                if pd.isna(raw_sheet_name): raw_sheet_name = udo_code
+                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names_lower)
                 print(f"处理 Sheet: {sheet_name} (UDO: {udo_code})")
 
-                # 初始化起始行
-                current_row = 0
+                pd.DataFrame().to_excel(writer, sheet_name=sheet_name, startrow=0, index=False)
+                worksheet = writer.sheets[sheet_name]
 
-                # 找出该 UDO 下包含的所有表 (通常有主表和子表)
-                # 按照 SQL 排序，通常主表在前
+                if not has_created_visible_sheet:
+                    worksheet.activate()
+                    has_created_visible_sheet = True
+
+                # 设置列宽
+                worksheet.set_column('A:A', 2)
+                worksheet.set_column('B:B', 20)
+                worksheet.set_column('C:C', 35)
+                worksheet.set_column('D:D', 18)
+                worksheet.set_column('E:E', 8)
+                worksheet.set_column('F:F', 21)
+                worksheet.set_column('G:G', 32)
+                worksheet.set_column('H:H', 15)
+                worksheet.set_column('I:I', 10)
+                worksheet.set_column('J:J', 20)
+
+                current_row = 1
                 table_list = udo_group['表'].unique()
+                table_type_val = udo_group.iloc[0]['UDO类型']
 
                 for table_id in table_list:
-                    # 获取该表的数据
+                    table_id = clean_text(str(table_id))
                     table_data = udo_group[udo_group['表'] == table_id]
                     table_desc = table_data.iloc[0]['表名称']
                     if pd.isna(table_desc): table_desc = ""
+                    table_desc = clean_text(str(table_desc))
 
-                    # 1. 写入小标题 (表名)
-                    # 先写入一个空的 DataFrame 来激活 sheet（如果还没创建）
-                    if current_row == 0:
-                        pd.DataFrame().to_excel(writer, sheet_name=sheet_name, startrow=0)
+                    is_header = table_data.iloc[0]['IsHeader']
 
-                    worksheet = writer.sheets[sheet_name]
+                    # --- 绘制表头块 ---
+                    worksheet.write(current_row, 1, "表名", label_fmt)
+                    worksheet.write(current_row, 2, table_id, value_fmt)
+                    worksheet.write(current_row, 3, "", value_fmt)
+                    worksheet.write(current_row, 4, "UDO代码", label_fmt)
+                    worksheet.merge_range(current_row, 5, current_row, 9, udo_code, value_fmt)
 
-                    # 写入类似 "Table: @HEAD - 描述" 的标题
-                    title_text = f"表: {table_id}  {table_desc}"
-                    worksheet.merge_range(current_row, 0, current_row, len(display_columns) - 1, title_text, title_fmt)
-                    current_row += 1
+                    worksheet.write(current_row + 1, 1, "描述", label_fmt)
+                    worksheet.write(current_row + 1, 2, table_desc, value_fmt)
+                    worksheet.write(current_row + 1, 3, "", value_fmt)
+                    worksheet.write(current_row + 1, 4, "类型", label_fmt)
+                    val_type = clean_text(str(table_type_val)) if pd.notna(table_type_val) else ""
+                    worksheet.merge_range(current_row + 1, 5, current_row + 1, 9, val_type, value_fmt)
 
-                    # 2. 写入数据表格
-                    # 仅写入需要的列
+                    worksheet.merge_range(current_row + 2, 1, current_row + 2, len(display_columns), "字段",
+                                          section_title_fmt)
+
+                    for col_idx, col_name in enumerate(display_columns):
+                        worksheet.write(current_row + 3, col_idx + 1, col_name, header_fmt)
+
+                    data_start_row = current_row + 4
                     data_to_write = table_data[display_columns]
-                    data_to_write.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
 
-                    # 设置表头格式 (to_excel 默认格式比较简陋，我们可以覆盖)
-                    for col_num, value in enumerate(data_to_write.columns.values):
-                        worksheet.write(current_row, col_num, value, header_fmt)
+                    # 逻辑: 主表(IsHeader=1) 且 类型含'主数据' -> 加 Code/Name
+                    if '主数据' in str(table_type_val) and is_header == 1:
+                        data_to_write = pd.concat([standard_fields_df, data_to_write], ignore_index=True)
 
-                    # 3. 更新行号 (数据行数 + 表头1行 + 空行间隔2行)
-                    current_row += len(data_to_write) + 1 + 2
+                    data_to_write = data_to_write.reset_index(drop=True)
+                    total_rows = len(data_to_write)
+
+                    for r_idx, row in data_to_write.iterrows():
+                        actual_row = data_start_row + r_idx
+                        is_last_row = (r_idx == total_rows - 1)
+                        for c_idx, val in enumerate(row):
+                            val = "" if pd.isna(val) else clean_text(str(val))
+                            col_pos = c_idx
+                            fmt_to_use = cell_fmt
+                            is_left_edge = (col_pos == 0)
+                            is_right_edge = (col_pos == len(display_columns) - 1)
+
+                            if is_last_row:
+                                if is_left_edge:
+                                    fmt_to_use = cell_bottom_left_thick_fmt
+                                elif is_right_edge:
+                                    fmt_to_use = cell_bottom_right_thick_fmt
+                                else:
+                                    fmt_to_use = cell_bottom_fmt
+                            else:
+                                if is_left_edge:
+                                    fmt_to_use = cell_left_thick_fmt
+                                elif is_right_edge:
+                                    fmt_to_use = cell_right_thick_fmt
+                                else:
+                                    fmt_to_use = cell_fmt
+
+                            if c_idx == 3 and val.isdigit():
+                                worksheet.write_number(actual_row, c_idx + 1, int(val), fmt_to_use)
+                            else:
+                                worksheet.write(actual_row, c_idx + 1, val, fmt_to_use)
+
+                        worksheet.data_validation(actual_row, 3, actual_row, 3,
+                                                  {'validate': 'list', 'source': type_list_formula})
+                        worksheet.data_validation(actual_row, 8, actual_row, 8,
+                                                  {'validate': 'list', 'source': yn_list_formula})
+
+                    current_row += 4 + len(data_to_write) + 2
 
             # --- 2. 处理 非UDO (独立表) ---
             df_no_udo = df[df['UDO代码'].isna()]
+            no_udo_groups = list(df_no_udo.groupby('表'))
 
-            # 按 表ID 分组迭代
-            for table_id, table_group in df_no_udo.groupby('表'):
-                # 取 表名称 作为 Sheet 名
+            if DEBUG_MODE:
+                no_udo_groups = no_udo_groups[:2]
+
+            for table_id, table_group in no_udo_groups:
+                table_id = clean_text(str(table_id))
                 raw_sheet_name = table_group.iloc[0]['表名称']
-                if pd.isna(raw_sheet_name):
-                    raw_sheet_name = table_id.replace('@', '')
-
-                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names)
+                if pd.isna(raw_sheet_name): raw_sheet_name = table_id.replace('@', '')
+                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names_lower)
                 print(f"处理 Sheet: {sheet_name} (Table: {table_id})")
 
-                # 直接写入数据
-                data_to_write = table_group[display_columns]
-                data_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
-
-                # 美化一下表头
+                pd.DataFrame().to_excel(writer, sheet_name=sheet_name, startrow=0, index=False)
                 worksheet = writer.sheets[sheet_name]
-                for col_num, value in enumerate(data_to_write.columns.values):
-                    worksheet.write(0, col_num, value, header_fmt)
 
-                # 自动调整列宽 (简单的估算)
-                worksheet.set_column(0, 0, 20)  # 字段名
-                worksheet.set_column(1, 1, 40)  # 描述
-                worksheet.set_column(4, 4, 30)  # 可选值
+                if not has_created_visible_sheet:
+                    worksheet.activate()
+                    has_created_visible_sheet = True
+
+                worksheet.set_column('A:A', 2)
+                worksheet.set_column('B:B', 20)
+                worksheet.set_column('C:C', 35)
+                worksheet.set_column('D:D', 18)
+                worksheet.set_column('E:E', 8)
+                worksheet.set_column('F:F', 21)
+                worksheet.set_column('G:G', 32)
+                worksheet.set_column('H:H', 15)
+                worksheet.set_column('I:I', 10)
+                worksheet.set_column('J:J', 20)
+
+                table_desc = clean_text(str(table_group.iloc[0]['表名称']))
+                current_row = 1
+
+                # 绘制无对象表的表头，增加 UDO代码(空) 和 类型(无对象表)
+                worksheet.write(current_row, 1, "表名", label_fmt)
+                worksheet.write(current_row, 2, table_id, value_fmt)
+                worksheet.write(current_row, 3, "", value_fmt)
+
+                worksheet.write(current_row, 4, "UDO代码", label_fmt)
+                # UDO代码为空
+                worksheet.merge_range(current_row, 5, current_row, 9, "", value_fmt)
+
+                worksheet.write(current_row + 1, 1, "描述", label_fmt)
+                worksheet.write(current_row + 1, 2, table_desc, value_fmt)
+                worksheet.write(current_row + 1, 3, "", value_fmt)
+
+                worksheet.write(current_row + 1, 4, "类型", label_fmt)
+                # 类型固定为 "无对象表"
+                worksheet.merge_range(current_row + 1, 5, current_row + 1, 9, "无对象表", value_fmt)
+
+                worksheet.merge_range(current_row + 2, 1, current_row + 2, len(display_columns), "字段",
+                                      section_title_fmt)
+
+                for col_idx, col_name in enumerate(display_columns):
+                    worksheet.write(current_row + 3, col_idx + 1, col_name, header_fmt)
+
+                data_start_row = current_row + 4
+                data_to_write = table_group[display_columns]
+                # 非UDO表 -> 始终添加 Code/Name
+                data_to_write = pd.concat([standard_fields_df, data_to_write], ignore_index=True)
+                data_to_write = data_to_write.reset_index(drop=True)
+                total_rows = len(data_to_write)
+
+                for r_idx, row in data_to_write.iterrows():
+                    actual_row = data_start_row + r_idx
+                    is_last_row = (r_idx == total_rows - 1)
+                    for c_idx, val in enumerate(row):
+                        val = "" if pd.isna(val) else clean_text(str(val))
+                        col_pos = c_idx
+                        fmt_to_use = cell_fmt
+                        is_left_edge = (col_pos == 0)
+                        is_right_edge = (col_pos == len(display_columns) - 1)
+                        if is_last_row:
+                            if is_left_edge:
+                                fmt_to_use = cell_bottom_left_thick_fmt
+                            elif is_right_edge:
+                                fmt_to_use = cell_bottom_right_thick_fmt
+                            else:
+                                fmt_to_use = cell_bottom_fmt
+                        else:
+                            if is_left_edge:
+                                fmt_to_use = cell_left_thick_fmt
+                            elif is_right_edge:
+                                fmt_to_use = cell_right_thick_fmt
+                            else:
+                                fmt_to_use = cell_fmt
+
+                        if c_idx == 3 and val.isdigit():
+                            worksheet.write_number(actual_row, c_idx + 1, int(val), fmt_to_use)
+                        else:
+                            worksheet.write(actual_row, c_idx + 1, val, fmt_to_use)
+
+                    worksheet.data_validation(actual_row, 3, actual_row, 3,
+                                              {'validate': 'list', 'source': type_list_formula})
+                    worksheet.data_validation(actual_row, 8, actual_row, 8,
+                                              {'validate': 'list', 'source': yn_list_formula})
+
+            # 最后创建配置 Sheet
+            ws_config = workbook.add_worksheet('_配置_可选值')
+            ws_config.hide()
+            ws_config.write_column('A1', valid_types)
+            ws_config.write_column('B1', ['Y', 'N'])
 
         print(f"\n成功! 文件已保存为: {OUTPUT_FILE}")
 
