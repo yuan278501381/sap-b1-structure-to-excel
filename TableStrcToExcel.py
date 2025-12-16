@@ -1,18 +1,18 @@
 import pandas as pd
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine
 import urllib.parse
+import pyodbc
+import socket
 
 # ================= 配置区域 =================
-# 请根据实际情况修改数据库连接信息
-DB_SERVER = '192.168.134.9'  # SQLSERVER 地址
-DB_NAME = 'KCC_test'  # 【请确认】您的数据库名称（例如账套名或 SBO_COMMON）
-DB_USER = 'sa'  # 数据库用户名
-DB_PASSWORD = '123456@a'  # 数据库密码
+DB_SERVER = '192.168.134.9'
+DB_NAME = 'KCC_test'
+DB_USER = 'sa'
+DB_PASSWORD = '123456@a'
 
-# 输出文件名
 OUTPUT_FILE = 'SAP_UDO_字段结构.xlsx'
 
-# 您的 SQL 查询语句 (已针对中文乱码进行优化，添加了 N 前缀)
+# SQL 查询保持不变
 SQL_QUERY = """
 SELECT 
       t2.Code  UDO代码,
@@ -43,7 +43,6 @@ SELECT
 
       CASE WHEN T0.TypeID = 'B' THEN NULL ELSE T0.EditSize END AS 长度,
 
-      -- 可选值 (Valid Values)
       (SELECT STRING_AGG(CAST(T1.FldValue AS NVARCHAR(MAX)) + N':' + CAST(T1.Descr AS NVARCHAR(MAX)) + N';', CHAR(13) + CHAR(10)) 
        FROM UFD1 T1 
        WHERE T1.TableID = T0.TableID AND T1.FieldID = T0.FieldID) AS 可选值,        
@@ -52,7 +51,6 @@ SELECT
 
 FROM CUFD T0
 LEFT JOIN (
-    -- 1. 获取 UDO 主表关联
     SELECT Code, Name, concat('@', TableName )TableName, Case when TYPE =1 then N'主数据' when TYPE=3 then N'单据'END Type
     FROM OUDO
     UNION 
@@ -72,86 +70,207 @@ ORDER BY t2.Code desc , T0.TableID, T0.FieldID;
 """
 
 
-def clean_sheet_name(name):
-    """Excel Sheet 名称不能包含特殊字符，且长度不能超过31个字符"""
-    if not name:
-        return "Unknown"
-    # 将 None 转换为空字符串
+def clean_sheet_name(name, used_names):
+    """Excel Sheet 名称清洗并确保唯一"""
+    if pd.isna(name) or name == "":
+        name = "Unknown"
     name = str(name)
     invalid_chars = ['\\', '/', '*', '[', ']', ':', '?']
     for char in invalid_chars:
         name = name.replace(char, '_')
-    # Excel 限制 31 个字符（Python 3 中中文算 1 个字符，这里截取 30 个保底）
-    return name[:30]
+
+    # 截取前30个字符
+    base_name = name[:25]  # 留一点空间给后缀
+    candidate = base_name
+    counter = 1
+
+    while candidate in used_names:
+        candidate = f"{base_name}_{counter}"
+        counter += 1
+
+    used_names.add(candidate)
+    return candidate
+
+
+def get_best_driver():
+    """检测并返回最佳的 SQL Server ODBC 驱动"""
+    try:
+        installed_drivers = pyodbc.drivers()
+        print(f"系统中已安装的 ODBC 驱动: {installed_drivers}")
+    except Exception:
+        return None
+
+    preferences = [
+        'ODBC Driver 18 for SQL Server',
+        'ODBC Driver 17 for SQL Server',
+        'SQL Server Native Client 11.0',
+        'ODBC Driver 13 for SQL Server',
+        'SQL Server'
+    ]
+
+    for pref in preferences:
+        if pref in installed_drivers:
+            return pref
+
+    for driver in installed_drivers:
+        if 'SQL Server' in driver:
+            return driver
+    return None
+
+
+def test_tcp_connection(host, port=1433):
+    """测试 TCP 端口连通性"""
+    print(f"\n--- 开始网络诊断 ---")
+    print(f"正在尝试连接主机 {host} 的端口 {port} ...")
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        result = sock.connect_ex((host, port))
+        sock.close()
+
+        if result == 0:
+            print(f"✅ 成功: 网络通畅，端口 {port} 开放。")
+            return True
+        else:
+            print(f"❌ 失败: 无法连接到 {host}:{port} (错误代码: {result})")
+            return False
+    except Exception as e:
+        print(f"❌ 测试出错: {e}")
+        return False
+    finally:
+        print(f"--- 诊断结束 ---\n")
 
 
 def export_to_excel():
-    print("正在连接数据库...")
+    # 0. 网络自检
+    if not test_tcp_connection(DB_SERVER, 1433):
+        print("警告: 网络连接测试失败，建议检查防火墙。")
 
-    # 构建连接字符串
-    # ODBC Driver 17 支持 Unicode，通常无需额外 charset 设置
-    # Python 3 默认也是 UTF-8，结合 N 前缀可以确保中文正常
+    print("正在连接数据库...")
+    driver_name = get_best_driver()
+    if not driver_name:
+        print("错误: 未找到任何 SQL Server ODBC 驱动！")
+        return
+    print(f"正在使用驱动程序: {driver_name}")
+
+    # 1. 构建连接字符串 (强制 TCP, 信任证书)
+    server_addr = DB_SERVER
+    if not server_addr.startswith('tcp:'):
+        server_addr = f'tcp:{server_addr}'
+
     params = urllib.parse.quote_plus(
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-        f"SERVER={DB_SERVER};"
+        f"DRIVER={{{driver_name}}};"
+        f"SERVER={server_addr};"
         f"DATABASE={DB_NAME};"
         f"UID={DB_USER};"
-        f"PWD={DB_PASSWORD}"
+        f"PWD={DB_PASSWORD};"
+        f"TrustServerCertificate=yes;"
     )
 
-    # 建立引擎
     engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
     try:
-        # 1. 读取数据
         print("正在执行 SQL 查询...")
         df = pd.read_sql(SQL_QUERY, engine)
+        print(f"查询完成，共获取 {len(df)} 行数据。正在生成 Excel...")
 
-        print(f"查询完成，共获取 {len(df)} 行数据。正在处理 Excel...")
+        # 定义要显示在表格里的核心列（去掉重复的表名、UDO名等）
+        display_columns = ['字段名', '描述', '类型', '长度', '可选值', '默认值', '链接表']
 
-        # 2. 创建 Excel Writer
-        # 使用 xlsxwriter 引擎，它对 Unicode 支持极好，不会出现 CSV 那种需要 BOM 头的问题
         with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter') as writer:
+            workbook = writer.book
 
-            # --- 处理 UDO 部分 ---
+            # 定义格式
+            header_fmt = workbook.add_format({
+                'bold': True, 'text_wrap': True, 'valign': 'top', 'fg_color': '#D7E4BC', 'border': 1})
+            title_fmt = workbook.add_format({
+                'bold': True, 'font_size': 12, 'font_color': '#366092', 'bg_color': '#F2F2F2', 'border': 1})
+
+            used_sheet_names = set()
+
+            # --- 1. 处理 UDO (按 UDO代码 分组) ---
             df_udo = df[df['UDO代码'].notna()]
-            udos = df_udo['UDO代码'].unique()
 
-            for udo_code in udos:
-                udo_data = df_udo[df_udo['UDO代码'] == udo_code]
+            # 按 UDO代码 分组迭代
+            for udo_code, udo_group in df_udo.groupby('UDO代码'):
+                # 取第一行的 UDO名 作为 Sheet 名
+                raw_sheet_name = udo_group.iloc[0]['UDO名']
+                if pd.isna(raw_sheet_name):
+                    raw_sheet_name = udo_code
 
-                # 使用 UDO代码作为 Sheet 名
-                sheet_name = clean_sheet_name(f"UDO_{udo_code}")
+                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names)
+                print(f"处理 Sheet: {sheet_name} (UDO: {udo_code})")
 
-                print(f"正在写入 Sheet: {sheet_name} (行数: {len(udo_data)})")
-                udo_data.to_excel(writer, sheet_name=sheet_name, index=False)
+                # 初始化起始行
+                current_row = 0
 
-            # --- 处理 非UDO (独立表) 部分 ---
+                # 找出该 UDO 下包含的所有表 (通常有主表和子表)
+                # 按照 SQL 排序，通常主表在前
+                table_list = udo_group['表'].unique()
+
+                for table_id in table_list:
+                    # 获取该表的数据
+                    table_data = udo_group[udo_group['表'] == table_id]
+                    table_desc = table_data.iloc[0]['表名称']
+                    if pd.isna(table_desc): table_desc = ""
+
+                    # 1. 写入小标题 (表名)
+                    # 先写入一个空的 DataFrame 来激活 sheet（如果还没创建）
+                    if current_row == 0:
+                        pd.DataFrame().to_excel(writer, sheet_name=sheet_name, startrow=0)
+
+                    worksheet = writer.sheets[sheet_name]
+
+                    # 写入类似 "Table: @HEAD - 描述" 的标题
+                    title_text = f"表: {table_id}  {table_desc}"
+                    worksheet.merge_range(current_row, 0, current_row, len(display_columns) - 1, title_text, title_fmt)
+                    current_row += 1
+
+                    # 2. 写入数据表格
+                    # 仅写入需要的列
+                    data_to_write = table_data[display_columns]
+                    data_to_write.to_excel(writer, sheet_name=sheet_name, startrow=current_row, index=False)
+
+                    # 设置表头格式 (to_excel 默认格式比较简陋，我们可以覆盖)
+                    for col_num, value in enumerate(data_to_write.columns.values):
+                        worksheet.write(current_row, col_num, value, header_fmt)
+
+                    # 3. 更新行号 (数据行数 + 表头1行 + 空行间隔2行)
+                    current_row += len(data_to_write) + 1 + 2
+
+            # --- 2. 处理 非UDO (独立表) ---
             df_no_udo = df[df['UDO代码'].isna()]
-            tables = df_no_udo['表'].unique()
 
-            for table_id in tables:
-                table_data = df_no_udo[df_no_udo['表'] == table_id]
+            # 按 表ID 分组迭代
+            for table_id, table_group in df_no_udo.groupby('表'):
+                # 取 表名称 作为 Sheet 名
+                raw_sheet_name = table_group.iloc[0]['表名称']
+                if pd.isna(raw_sheet_name):
+                    raw_sheet_name = table_id.replace('@', '')
 
-                # 清理表名作为 Sheet 名
-                clean_table = table_id.replace('@', '')
-                sheet_name = clean_sheet_name(f"表_{clean_table}")
+                sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names)
+                print(f"处理 Sheet: {sheet_name} (Table: {table_id})")
 
-                print(f"正在写入 Sheet: {sheet_name} (行数: {len(table_data)})")
-                table_data.to_excel(writer, sheet_name=sheet_name, index=False)
+                # 直接写入数据
+                data_to_write = table_group[display_columns]
+                data_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
 
-            # 如果没有数据
-            if len(df) == 0:
-                print("警告: 查询结果为空，生成了空文件。")
-                pd.DataFrame().to_excel(writer, sheet_name="无数据")
+                # 美化一下表头
+                worksheet = writer.sheets[sheet_name]
+                for col_num, value in enumerate(data_to_write.columns.values):
+                    worksheet.write(0, col_num, value, header_fmt)
+
+                # 自动调整列宽 (简单的估算)
+                worksheet.set_column(0, 0, 20)  # 字段名
+                worksheet.set_column(1, 1, 40)  # 描述
+                worksheet.set_column(4, 4, 30)  # 可选值
 
         print(f"\n成功! 文件已保存为: {OUTPUT_FILE}")
-        print("提示: 这是一个 Excel 文件，原生支持中文，无需担心乱码。")
 
     except Exception as e:
         print(f"\n发生错误: {e}")
-        print("提示: 请确保已安装 pandas, sqlalchemy, pyodbc 和 xlsxwriter 库。")
-        print("pip install pandas sqlalchemy pyodbc xlsxwriter")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
