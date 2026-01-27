@@ -1,5 +1,5 @@
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 import urllib.parse
 import pyodbc
 import socket
@@ -13,12 +13,10 @@ DB_PASSWORD = '123456@a'
 
 OUTPUT_FILE = 'SAP_UDO_字段结构.xlsx'
 
-# 调试模式
+# 调试模式 (True: 仅导出少量UDO用于测试; False: 导出全部)
 DEBUG_MODE = False
 
-# SQL 查询:
-# 1. 增加了 t2.IsHeader 字段来区分主表和行表
-# 2. 修改了 t2.Type 逻辑，拼接了 UDO 属性 (可移除/可关闭/可取消)
+# SQL 查询逻辑保持不变
 SQL_QUERY = """
 SELECT 
       t2.Code  UDO代码,
@@ -87,11 +85,7 @@ LEFT JOIN OUTB t3 on CONCAT('@', t3.TableName)= t0.TableID
 WHERE 
       1 = 1 
       and t0.TableID in (
-   '@CH_ORGITYPE','@ITEMTYPE','@KCC_ATTR1','@MAIN_COLOR_CARD','@MAIN_COLOR_CODE','@PRODUCT_ATTR','@PRODUCT_ATTR_1',
-   '@RULE_EXPR','@RULE_EXPR_1','@RULE_GEN','@RULE_GEN_1','@RULE_ITEM_MASTER','@RULE_ITEM_MASTER_1','@RULE_ITMCODE_CRT','@RULE_ITMCODE_CRT_1',
-   '@RULE_ITMCODE_CRT_2','@RULE_TXT_EXPR','@RULE_TXT_EXPR_1','@TMP_CLASS','@TMP_LOWERSTOP','@TMP_STRAPE','@TMP_TEETH','@TMP_UPPERSTOP','@TYPE','@WHS_HEAD',
-   '@ZIPPER_HEAD_COLOR','@ZIPPER_HEAD_COLORCD','@ZIPPER_HEAD_CONNCT','@ZIPPER_HEAD_LABEL','@ZIPPER_PULL_TAB','@ZIPPER_PULL_TAB_1'
-      )
+  '@CH_ORDR','@CH_ORDR_1','@CH_ORDR_3','@CH_OQUT','@CH_OQUT_1' ,'@CH_OQUT_3'      )
 
 ORDER BY t2.Code desc , T0.TableID, T0.FieldID;
 """
@@ -102,64 +96,47 @@ def clean_text(text):
     深度清洗字符串，防止 Excel 损坏。
     """
     if not isinstance(text, str): return text
-
-    # 1. 移除 Excel 不支持的控制字符 (ASCII 0-31, 排除 \n \r \t)
+    # 移除 Excel 不支持的控制字符
     text = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F]', '', text)
-
-    # 2. Excel 单元格最大支持 32767 字符。如果超长，直接截断。
+    # 截断超长文本
     if len(text) > 32700:
         text = text[:32700] + "..."
-
-    # 3. 防止将文本误判为公式。如果以 '=' 开头，前面加单引号强制转文本。
+    # 防止公式注入
     if text.startswith('='):
         text = "'" + text
-
     return text
 
 
 def clean_sheet_name(name, used_names_lower):
+    """
+    清洗并确保 Sheet 名称唯一且合法
+    """
     if pd.isna(name) or name == "": name = "Unknown"
     name = str(name)
-
-    # 1. 替换掉 Excel Sheet 名称不支持的特殊字符，全部替换为空格
-    # Excel 英文禁止: \ / * [ ] : ?
-    # 增加中文全角符号替换: ： ？ ／ ＼ ［ ］ 【 】 *
-    invalid_chars = [
-        '\\', '/', '*', '[', ']', ':', '?',
-        '：', '？', '／', '＼', '［', '］', '【', '】'
-    ]
-
+    invalid_chars = ['\\', '/', '*', '[', ']', ':', '?', '：', '？', '／', '＼', '［', '］', '【', '】']
     for char in invalid_chars:
         name = name.replace(char, ' ')
-
-    # 2. 去除首尾空格
     name = name.strip()
+    if not name: name = "Unknown"
 
-    # 3. 如果 strip 后为空，给予默认名
-    if not name:
-        name = "Unknown"
-
-    # 截取前25个字符 (留出空间给后缀)
     base_name = name[:25]
     candidate = base_name
     counter = 1
-
-    # 确保唯一性 (忽略大小写)
     while candidate.lower() in used_names_lower:
         candidate = f"{base_name}_{counter}"
         counter += 1
-
     used_names_lower.add(candidate.lower())
     return candidate
 
 
 def get_best_driver():
+    """获取最佳 SQL Server ODBC 驱动"""
     try:
         installed_drivers = pyodbc.drivers()
     except Exception:
         return None
-    preferences = ['ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server', 'SQL Server Native Client 11.0',
-                   'ODBC Driver 13 for SQL Server', 'SQL Server']
+    preferences = ['ODBC Driver 18 for SQL Server', 'ODBC Driver 17 for SQL Server',
+                   'SQL Server Native Client 11.0', 'ODBC Driver 13 for SQL Server', 'SQL Server']
     for pref in preferences:
         if pref in installed_drivers: return pref
     for driver in installed_drivers:
@@ -168,6 +145,7 @@ def get_best_driver():
 
 
 def test_tcp_connection(host, port=1433):
+    """网络连通性测试"""
     print(f"\n--- 开始网络诊断 ---")
     print(f"正在尝试连接主机 {host} 的端口 {port} ...")
     try:
@@ -188,6 +166,69 @@ def test_tcp_connection(host, port=1433):
         print(f"--- 诊断结束 ---\n")
 
 
+def enrich_linked_table_values(df, engine):
+    """
+    核心增强逻辑：
+    遍历数据中出现的 '设置链接表'，查询目标表的前50条数据，
+    拼按 'Code-Name;' 格式填充到 '可选值' 列。
+    """
+    print("\n[处理链接表] 开始获取链接表数据...")
+
+    # 筛选出有链接表的行，提取唯一的表名
+    # 注意：此时 df 列名已经 rename 过了，所以用 '设置链接表'
+    if '设置链接表' not in df.columns:
+        print("警告：未找到 '设置链接表' 列，跳过处理。")
+        return df
+
+    # 获取所有非空且非空字符串的链接表名
+    linked_tables = df[df['设置链接表'].notna() & (df['设置链接表'] != '')]['设置链接表'].unique()
+
+    # 缓存查询结果，避免同个表重复查询
+    table_cache = {}
+
+    with engine.connect() as conn:
+        for table_name in linked_tables:
+            try:
+                # 构造查询 SQL
+                # 1. 强制使用 TOP 50 防止数据量过大撑爆 Excel 单元格
+                # 2. 假设目标表都有 Code 和 Name 字段 (适用于大多数 UDO 和自定义表)
+                # 3. 使用中括号 [] 包裹表名，防止表名含特殊字符报错
+                sql = text(f"SELECT TOP 50 Code, Name FROM [@{table_name}] ORDER BY Code")
+
+                result = conn.execute(sql).fetchall()
+
+                if result:
+                    # 拼接字符串: Code-Name; 换行
+                    # 使用 char(13)+char(10) 在 python 中对应 \n，Excel 会识别为换行
+                    value_list = [f"{str(row[0])}-{str(row[1])};" for row in result]
+                    joined_str = "\n".join(value_list)
+
+                    # 如果达到了 50 条，加个提示
+                    if len(result) >= 50:
+                        joined_str += "\n...(仅显示前50条)"
+
+                    table_cache[table_name] = joined_str
+                else:
+                    table_cache[table_name] = "(链接表中无数据)"
+
+            except Exception as e:
+                error_msg = str(e).split(']')[0]  # 简化错误信息
+                print(f"  -> 读取链接表 [{table_name}] 失败: {error_msg}")
+                # 可能是没有 Code/Name 字段，或者表不存在
+                table_cache[table_name] = f"(无法读取链接表: 缺少Code/Name字段或权限不足)"
+
+    # 将缓存的数据回填到 DataFrame
+    # 逻辑：如果 '设置链接表' 有值，则用查到的数据覆盖 '可选值'
+    for table_name, valid_values_str in table_cache.items():
+        # 找到对应链接表的所有行
+        mask = df['设置链接表'] == table_name
+        # 赋值
+        df.loc[mask, '可选值'] = valid_values_str
+
+    print(f"[处理链接表] 完成，共处理 {len(table_cache)} 个链接表。\n")
+    return df
+
+
 def export_to_excel():
     if not test_tcp_connection(DB_SERVER, 1433):
         print("警告: 网络连接测试失败，建议检查防火墙。")
@@ -203,6 +244,7 @@ def export_to_excel():
     if not server_addr.startswith('tcp:'):
         server_addr = f'tcp:{server_addr}'
 
+    # 构造连接字符串
     params = urllib.parse.quote_plus(
         f"DRIVER={{{driver_name}}};"
         f"SERVER={server_addr};"
@@ -215,12 +257,19 @@ def export_to_excel():
     engine = create_engine(f"mssql+pyodbc:///?odbc_connect={params}")
 
     try:
-        print("正在执行 SQL 查询...")
+        print("正在执行主 SQL 查询...")
         df = pd.read_sql(SQL_QUERY, engine)
-        print(f"查询完成，共获取 {len(df)} 行数据。正在生成 Excel...")
+        print(f"查询完成，共获取 {len(df)} 行字段定义。")
 
+        # 重命名列以匹配后续逻辑
         df = df.rename(columns={'链接表': '设置链接表', '默认值': '字段默认值'})
         if '备注' not in df.columns: df['备注'] = ""
+
+        # ---------------------------------------------------------
+        # 新增逻辑：处理链接表数据回填
+        # ---------------------------------------------------------
+        df = enrich_linked_table_values(df, engine)
+        # ---------------------------------------------------------
 
         # 将“长度”列转换为 Int64 类型，去除 .0 小数位
         df['长度'] = pd.to_numeric(df['长度'], errors='coerce').astype('Int64')
@@ -234,6 +283,8 @@ def export_to_excel():
             {'字段名': 'Name', '描述': '名称', '类型': '字母数字-文本', '长度': 100, '设置链接表': '', '可选值': '',
              '字段默认值': '', '必填字段': 'Y', '备注': ''}
         ])
+
+        print(f"正在生成 Excel 文件: {OUTPUT_FILE} ...")
 
         with pd.ExcelWriter(OUTPUT_FILE, engine='xlsxwriter',
                             engine_kwargs={'options': {'strings_to_urls': False, 'nan_inf_to_errors': True}}) as writer:
@@ -250,7 +301,7 @@ def export_to_excel():
             section_title_fmt = workbook.add_format(
                 {**base_style, 'bold': True, 'bg_color': '#BFBFBF', 'border': 2, 'align': 'center'})
 
-            # 1. 顶端对齐格式 (Top Aligned) - 用于可选值、备注
+            # 样式：顶端对齐 (用于可选值)
             cell_fmt = workbook.add_format({**base_style, 'border': 1, 'valign': 'top', 'text_wrap': True})
             cell_left_thick_fmt = workbook.add_format(
                 {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 1, 'valign': 'top', 'text_wrap': True})
@@ -263,7 +314,7 @@ def export_to_excel():
             cell_bottom_right_thick_fmt = workbook.add_format(
                 {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 2, 'valign': 'top', 'text_wrap': True})
 
-            # 2. 垂直居中格式 (Vertical Center) - 用于其他列
+            # 样式：垂直居中 (用于其他列)
             cell_fmt_vc = workbook.add_format({**base_style, 'border': 1, 'valign': 'vcenter', 'text_wrap': True})
             cell_left_thick_fmt_vc = workbook.add_format(
                 {**base_style, 'left': 2, 'right': 1, 'top': 1, 'bottom': 1, 'valign': 'vcenter', 'text_wrap': True})
@@ -277,13 +328,11 @@ def export_to_excel():
                 {**base_style, 'left': 1, 'right': 2, 'top': 1, 'bottom': 2, 'valign': 'vcenter', 'text_wrap': True})
 
             used_sheet_names_lower = set()
-
             valid_types = ['字母数字-定期', '字母数字-文本', '数字', '日期', '时间', '单位与总计-金额',
                            '单位与总计-价格', '单位与总计-数量', '单位与总计-百分比', '单位与总计-度量', '图片',
                            '复选框', '备注']
             type_list_formula = f"='_配置_可选值'!$A$1:$A${len(valid_types)}"
             yn_list_formula = "='_配置_可选值'!$B$1:$B$2"
-
             has_created_visible_sheet = False
 
             # --- 1. 处理 UDO (按 UDO代码 分组) ---
@@ -299,8 +348,9 @@ def export_to_excel():
                 raw_sheet_name = udo_group.iloc[0]['UDO名']
                 if pd.isna(raw_sheet_name): raw_sheet_name = udo_code
                 sheet_name = clean_sheet_name(raw_sheet_name, used_sheet_names_lower)
-                print(f"处理 Sheet: {sheet_name} (UDO: {udo_code})")
 
+                print(f"处理 Sheet: {sheet_name} (UDO: {udo_code})")
+                # 创建 Sheet
                 pd.DataFrame().to_excel(writer, sheet_name=sheet_name, startrow=0, index=False)
                 worksheet = writer.sheets[sheet_name]
 
@@ -315,7 +365,7 @@ def export_to_excel():
                 worksheet.set_column('D:D', 18)
                 worksheet.set_column('E:E', 8)
                 worksheet.set_column('F:F', 21)
-                worksheet.set_column('G:G', 32)
+                worksheet.set_column('G:G', 32)  # 可选值列
                 worksheet.set_column('H:H', 15)
                 worksheet.set_column('I:I', 10)
                 worksheet.set_column('J:J', 20)
@@ -356,7 +406,6 @@ def export_to_excel():
                     data_start_row = current_row + 4
                     data_to_write = table_data[display_columns]
 
-                    # 逻辑: 主表(IsHeader=1) 且 类型含'主数据' -> 加 Code/Name
                     if '主数据' in str(table_type_val) and is_header == 1:
                         data_to_write = pd.concat([standard_fields_df, data_to_write], ignore_index=True)
 
@@ -370,9 +419,8 @@ def export_to_excel():
                             val = "" if pd.isna(val) else clean_text(str(val))
                             col_pos = c_idx
 
-                            # 决定是否垂直居中
-                            # 0:字段名, 1:描述, 2:类型, 3:长度, 4:设置链接表, 5:可选值, 6:字段默认值, 7:必填字段, 8:备注
-                            # 目标: 垂直居中 -> 0, 1, 2, 3, 4, 6, 7
+                            # 垂直居中判断
+                            # 5: 可选值 (链接表数据可能很长，保持 Top Align)
                             use_vc = col_pos in [0, 1, 2, 3, 4, 6, 7]
 
                             is_left_edge = (col_pos == 0)
@@ -440,21 +488,16 @@ def export_to_excel():
                 table_desc = clean_text(str(table_group.iloc[0]['表名称']))
                 current_row = 1
 
-                # 绘制无对象表的表头，增加 UDO代码(空) 和 类型(无对象表)
                 worksheet.write(current_row, 1, "表名", label_fmt)
                 worksheet.write(current_row, 2, table_id, value_fmt)
                 worksheet.write(current_row, 3, "", value_fmt)
-
                 worksheet.write(current_row, 4, "UDO代码", label_fmt)
-                # UDO代码为空
                 worksheet.merge_range(current_row, 5, current_row, 9, "", value_fmt)
 
                 worksheet.write(current_row + 1, 1, "描述", label_fmt)
                 worksheet.write(current_row + 1, 2, table_desc, value_fmt)
                 worksheet.write(current_row + 1, 3, "", value_fmt)
-
                 worksheet.write(current_row + 1, 4, "类型", label_fmt)
-                # 类型固定为 "无对象表"
                 worksheet.merge_range(current_row + 1, 5, current_row + 1, 9, "无对象表", value_fmt)
 
                 worksheet.merge_range(current_row + 2, 1, current_row + 2, len(display_columns), "字段",
@@ -465,7 +508,6 @@ def export_to_excel():
 
                 data_start_row = current_row + 4
                 data_to_write = table_group[display_columns]
-                # 非UDO表 -> 始终添加 Code/Name
                 data_to_write = pd.concat([standard_fields_df, data_to_write], ignore_index=True)
                 data_to_write = data_to_write.reset_index(drop=True)
                 total_rows = len(data_to_write)
@@ -477,8 +519,6 @@ def export_to_excel():
                         val = "" if pd.isna(val) else clean_text(str(val))
                         col_pos = c_idx
 
-                        # 决定是否垂直居中
-                        # 0:字段名, 1:描述, 2:类型, 3:长度, 4:设置链接表, 5:可选值, 6:字段默认值, 7:必填字段, 8:备注
                         use_vc = col_pos in [0, 1, 2, 3, 4, 6, 7]
 
                         is_left_edge = (col_pos == 0)
@@ -508,7 +548,7 @@ def export_to_excel():
                     worksheet.data_validation(actual_row, 8, actual_row, 8,
                                               {'validate': 'list', 'source': yn_list_formula})
 
-            # 最后创建配置 Sheet
+            # 配置 Sheet
             ws_config = workbook.add_worksheet('_配置_可选值')
             ws_config.hide()
             ws_config.write_column('A1', valid_types)
